@@ -58,11 +58,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg wireguard-tools
           python3 -m pip install -q --upgrade yt-dlp
-          if [ "${{ inputs.transcribe }}" = "true" ]; then
-            # faster-whisper 必须和 av 一起升级，否则旧 av 报
-            # TypeError: open() got an unexpected keyword argument 'metadata_errors'
-            python3 -m pip install -q -U faster-whisper av
-          fi
           echo "yt-dlp = $(yt-dlp --version)"
 
       - name: 解析 URL
@@ -140,10 +135,16 @@ jobs:
         if: always()
         run: sudo wg-quick down /tmp/wgcf-profile.conf || true
 
-      - name: whisper 转写（可选；模型下载走正常网络，WARP 下会拉崩）
+      - name: whisper 转写（独立 venv，隔离 runner 预装的旧版 av）
         if: ${{ inputs.transcribe == 'true' }}
         continue-on-error: true
         run: |
+          # runner 镜像预装了旧版 PyAV，且 ~/.local 与系统 dist-packages 互相遮蔽，
+          # pip install -U av 顶不掉它。用全新 venv 从根上隔离。
+          python3 -m venv /tmp/wv
+          /tmp/wv/bin/pip install -q -U faster-whisper
+          echo "--- 版本（留证据）---"
+          /tmp/wv/bin/python -c "import av, faster_whisper; print('av =', av.__version__); print('faster-whisper =', faster_whisper.__version__)"
           cat > /tmp/tr.py <<'PY'
           import sys
           from faster_whisper import WhisperModel
@@ -156,7 +157,7 @@ jobs:
           AUDIO=$(ls out/audio.* | head -1)
           for i in 1 2 3; do
             echo "--- 转写尝试 $i ---"
-            if python3 /tmp/tr.py "$AUDIO"; then echo "✅ 转写完成"; exit 0; fi
+            if /tmp/wv/bin/python /tmp/tr.py "$AUDIO"; then echo "✅ 转写完成"; exit 0; fi
             echo "失败，15 秒后重试"; sleep 15
           done
           echo "⚠️ 三次转写均失败，放行（不阻塞抽帧交付）"
