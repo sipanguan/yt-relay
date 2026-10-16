@@ -93,10 +93,13 @@ jobs:
           Q: ${{ inputs.quality }}
         run: |
           mkdir -p out/frames
+          # WARP 同时给 IPv4/IPv6，googlevideo 走 IPv6 常握手超时（_ssl.c:983），
+          # 所以强制 IPv4；并加大重试与超时。
           yt-dlp --no-warnings \
+            --force-ipv4 --retries 20 --fragment-retries 20 --socket-timeout 30 \
             -f "bv*[height<=${Q}]+ba/b[height<=${Q}]/b" \
             --merge-output-format mp4 -o "out/video.%(ext)s" "$URL"
-          yt-dlp --no-warnings --skip-download --dump-single-json "$URL" > out/meta.json || true
+          yt-dlp --no-warnings --force-ipv4 --skip-download --dump-single-json "$URL" > out/meta.json || true
           ls -la out/ out/frames/
 
       - name: 抽帧
