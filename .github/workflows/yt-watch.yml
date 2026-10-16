@@ -1,0 +1,146 @@
+name: yt-watch
+
+# 用途：让 Agent“看” YouTube 视频。
+# 本机（阿里 DSW 容器）对 youtube.com / googlevideo.com 双重封锁（DNS 投毒 + IP 段阻断），
+# 无法直接访问；但 GitHub 的 runner 有完整外网。这里借用 runner 下载视频、抽帧、转写，
+# 结果 commit 回仓库，本机再经 codeload.github.com 拉回。
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'YouTube URL 或 11 位视频 ID'
+        required: true
+        type: string
+      frames:
+        description: '抽取几张关键帧'
+        required: false
+        default: '12'
+      start:
+        description: '从第几秒开始（0=开头）'
+        required: false
+        default: '0'
+      duration:
+        description: '取多少秒（0=整片）'
+        required: false
+        default: '0'
+      quality:
+        description: '最大分辨率（如 360 / 720）'
+        required: false
+        default: '360'
+      transcribe:
+        description: '同时跑 whisper 转写（无字幕视频用，较慢）'
+        required: false
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install -q --upgrade yt-dlp
+
+      - name: 解析 URL
+        id: u
+        env:
+          RAW: ${{ inputs.url }}
+        run: |
+          RAW="$RAW"
+          if [ ${#RAW} -eq 11 ] && [[ "$RAW" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            RAW="https://www.youtube.com/watch?v=$RAW"
+          fi
+          echo "url=$RAW" >> "$GITHUB_OUTPUT"
+          echo "解析为: $RAW"
+
+      - name: 下载视频
+        env:
+          URL: ${{ steps.u.outputs.url }}
+          Q: ${{ inputs.quality }}
+        run: |
+          set -x
+          mkdir -p out/frames
+          yt-dlp --no-warnings -f "bv*[height<=${Q}]+ba/b[height<=${Q}]/b" \
+            --merge-output-format mp4 -o "out/video.%(ext)s" "$URL"
+          yt-dlp --no-warnings --skip-download --dump-single-json "$URL" > out/meta.json || true
+          ls -la out/
+
+      - name: 抽帧
+        env:
+          FRAMES: ${{ inputs.frames }}
+          START: ${{ inputs.start }}
+          DUR: ${{ inputs.duration }}
+        run: |
+          SRC=$(ls out/video.* | head -1)
+          TOTAL=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$SRC" | cut -d. -f1)
+          # 有效时长
+          if [ "$DUR" = "0" ]; then EFF=$((TOTAL - START)); else EFF=$DUR; fi
+          [ "$EFF" -lt 1 ] && EFF=1
+          FPS=$(python3 -c "print(max(0.02, $FRAMES/$EFF))")
+          echo "总长=${TOTAL}s 起点=${START}s 取${EFF}s 抽 ${FRAMES} 帧 fps=$FPS"
+          ffmpeg -hide_banner -loglevel error -ss "$START" -t "$EFF" -i "$SRC" \
+            -vf "fps=$FPS,scale=-2:480" -q:v 3 out/frames/f%03d.jpg
+          ls -la out/frames/ | head -20
+
+      - name: 抓字幕（有就抓，没有则跳过）
+        env:
+          URL: ${{ steps.u.outputs.url }}
+        run: |
+          yt-dlp --no-warnings --skip-download --write-subs --write-auto-subs \
+            --sub-langs "zh.*,en.*" --sub-format vtt -o "out/subs" "$URL" || true
+          ls -la out/ | grep -i sub || echo "无字幕轨"
+
+      - name: whisper 转写（可选，无字幕视频用）
+        if: ${{ inputs.transcribe == 'true' }}
+        env:
+          URL: ${{ steps.u.outputs.url }}
+        run: |
+          python3 -m pip install -q faster-whisper
+          yt-dlp --no-warnings -f "ba/b" -o "out/audio.%(ext)s" "$URL"
+          AUDIO=$(ls out/audio.* | head -1)
+          cat > /tmp/tr.py <<'PY'
+          import sys
+          from faster_whisper import WhisperModel
+          m = WhisperModel("small", device="cpu", compute_type="int8")
+          segs, info = m.transcribe(sys.argv[1], vad_filter=True)
+          lines = ["[%7.1f] %s" % (s.start, s.text.strip()) for s in segs]
+          open("out/transcript.txt", "w").write("\n".join(lines))
+          print("transcript segments:", len(lines))
+          PY
+          python3 /tmp/tr.py "$AUDIO"
+
+      - name: 打包元信息
+        env:
+          URL: ${{ steps.u.outputs.url }}
+        run: |
+          {
+            echo "# yt-watch 结果"
+            echo
+            echo "- URL: $URL"
+            echo "- 抽帧: ${{ inputs.frames }} 张"
+            echo "- 时间: $(date -u +%FT%TZ)"
+            echo
+            echo "## 文件"
+            find out -type f | sed 's/^/- /'
+          } > out/SUMMARY.md
+          cat out/SUMMARY.md
+
+      - name: 提交回仓库（本机经 codeload 拉取）
+        run: |
+          git config user.name  "yt-watch-bot"
+          git config user.email "yt-watch-bot@users.noreply.github.com"
+          # 清掉上一轮结果，避免仓库膨胀
+          rm -rf latest out/video.* out/audio.*
+          mkdir -p latest
+          cp -r out/* latest/ 2>/dev/null || true
+          rm -rf out
+          git add -A
+          git commit -m "yt-watch: frames $(date -u +%FT%TZ) [skip ci]" || echo "无变更"
+          git push
