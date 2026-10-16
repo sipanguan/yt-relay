@@ -1,0 +1,70 @@
+name: probe
+
+# 诊断用：在 runner 上一次性试遍各种 yt-dlp youtube player_client，
+# 找出哪个能绕过 "Sign in to confirm you're not a bot"（数据中心 IP 的 bot 检查）。
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'YouTube URL 或 ID'
+        required: false
+        default: 'https://www.youtube.com/watch?v=jNQXAC9IVRw'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 环境
+        run: |
+          python3 -m pip install -q --upgrade yt-dlp
+          echo "yt-dlp 版本: $(yt-dlp --version)"
+
+      - name: runner 出口 IP（供判断是不是数据中心段）
+        run: |
+          echo "出口 IP: $(curl -s -m 15 https://api.ipify.org || echo 取不到)"
+
+      - name: 客户端矩阵探测
+        env:
+          URL: ${{ inputs.url }}
+        run: |
+          for c in android_vr tv_embedded ios mweb web_embedded tv web_safari android default; do
+            echo ""
+            echo "════════ player_client=$c ════════"
+            if timeout 75 yt-dlp --no-warnings --skip-download \
+                 --print "  ✅ OK | %(title).50s | %(duration)s 秒" \
+                 --extractor-args "youtube:player_client=$c" "$URL" 2>&1 | tail -4; then
+              echo "  [RESULT] $c = OK"
+            else
+              echo "  [RESULT] $c = FAIL"
+            fi
+          done
+
+      - name: 组合降级探测（client + player_skip）
+        env:
+          URL: ${{ inputs.url }}
+        run: |
+          for combo in \
+            "android_vr|" \
+            "default,-web|" \
+            "tv|webpage,configs" \
+            "android_vr|webpage" \
+            "web_embedded|webpage,configs"
+          do
+            c="${combo%%|*}"; sk="${combo##*|}"
+            echo ""
+            echo "════════ client=$c skip=$sk ════════"
+            ARGS="--extractor-args youtube:player_client=$c"
+            [ -n "$sk" ] && ARGS="$ARGS --extractor-args youtube:player_skip=$sk"
+            if timeout 75 yt-dlp --no-warnings --skip-download \
+                 --print "  ✅ OK | %(title).50s" $ARGS "$URL" 2>&1 | tail -3; then
+              echo "  [RESULT] $c/$sk = OK"
+            else
+              echo "  [RESULT] $c/$sk = FAIL"
+            fi
+          done
+
+      - name: 试试 bilibili 同款路径是否正常（对照组）
+        run: |
+          echo "对照组：非 YouTube 站点能否下载（排除 runner 出网问题）"
+          timeout 60 yt-dlp --no-warnings --skip-download --print "  ✅ 对照组可用 | %(title).60s" \
+            "https://www.bilibili.com/video/BV1GJ411x7h7" 2>&1 | tail -3 || echo "  对照组也失败"
