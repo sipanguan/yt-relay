@@ -1,0 +1,79 @@
+name: warptest
+
+# 诊断：GitHub runner 的 Azure IP 被 YouTube 标记，试试套 Cloudflare WARP 换出口 IP。
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'YouTube URL 或 ID'
+        required: false
+        default: 'https://www.youtube.com/watch?v=jNQXAC9IVRw'
+
+jobs:
+  w:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 基线：不套 WARP 直连
+        env:
+          URL: ${{ inputs.url }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install -q -U yt-dlp
+          echo "原始出口IP = $(curl -s -m 15 https://api.ipify.org || echo 取不到)"
+          echo "--- 基线尝试 ---"
+          if yt-dlp --no-warnings --skip-download --print "  ✅ baseline 可用 | %(title).50s" "$URL" 2>&1 | tail -3; then
+            echo "  [基线] 结果=成功"
+          else
+            echo "  [基线] 结果=失败"
+          fi
+
+      - name: 安装 wgcf + wireguard
+        run: |
+          sudo apt-get install -y -qq wireguard-tools
+          TAG=$(curl -s -m 25 https://api.github.com/repos/ViRb3/wgcf/releases/latest \
+                | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
+          VER=${TAG#v}
+          echo "wgcf 版本 = $TAG"
+          curl -fsSL -o /tmp/wgcf \
+            "https://github.com/ViRb3/wgcf/releases/download/${TAG}/wgcf_${VER}_linux_amd64"
+          chmod +x /tmp/wgcf
+          /tmp/wgcf --version || true
+
+      - name: 注册 WARP 账号并生成配置
+        run: |
+          cd /tmp
+          /tmp/wgcf register --accept-tos || echo "register 可能已存在"
+          /tmp/wgcf generate
+          echo "--- 配置生成 ---"
+          ls -la /tmp/wgcf-profile.conf
+          echo "内核 wireguard 支持: $(modinfo wireguard 2>/dev/null | head -2 || echo '未找到模块(将尝试内置)')"
+
+      - name: 连接 WARP
+        run: |
+          sudo wg-quick up /tmp/wgcf-profile.conf 2>&1 | tail -20 || echo "  ⚠️ wg-quick 失败"
+          sleep 6
+          echo ""
+          echo "WARP 后出口IP = $(curl -s -m 20 https://api.ipify.org || echo 取不到)"
+          sudo wg show 2>/dev/null | head -10 || true
+
+      - name: WARP 下试取元信息
+        env:
+          URL: ${{ inputs.url }}
+        run: |
+          echo "--- WARP 下尝试 ---"
+          yt-dlp --no-warnings --skip-download --print "  ✅ WARP 可用 | %(title).60s | %(duration)s秒" "$URL" 2>&1 | tail -8
+
+      - name: WARP 下真下载 + 抽帧
+        env:
+          URL: ${{ inputs.url }}
+        run: |
+          if yt-dlp --no-warnings -f "bv*[height<=360]+ba/b[height<=360]/b" \
+               --merge-output-format mp4 -o v.mp4 "$URL"; then
+            echo "  ✅ 真下载成功: $(ls -la v.mp4 | awk '{print $5}') 字节"
+            echo "  时长: $(ffprobe -v error -show_entries format=duration -of csv=p=0 v.mp4) 秒"
+            mkdir -p frames
+            ffmpeg -hide_banner -loglevel error -i v.mp4 -vf "fps=1,scale=-2:360" -frames:v 8 frames/f%02d.jpg
+            echo "  抽帧: $(ls frames | wc -l) 张"
+          else
+            echo "  ❌ WARP 下仍失败"
+          fi
