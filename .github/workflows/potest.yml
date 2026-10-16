@@ -1,0 +1,76 @@
+name: potest
+
+# 诊断：用 bgutil PO token provider 绕 YouTube 对 GitHub runner IP 的 bot 检查。
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'YouTube URL 或 ID'
+        required: false
+        default: 'https://www.youtube.com/watch?v=jNQXAC9IVRw'
+
+jobs:
+  po:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 基础环境
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install -q --upgrade yt-dlp
+          echo "yt-dlp = $(yt-dlp --version)"
+          echo "node   = $(node -v)"
+          echo "出口IP = $(curl -s -m 15 https://api.ipify.org || echo 取不到)"
+
+      - name: 取最新版本号并装 yt-dlp 插件
+        run: |
+          TAG=$(curl -s -m 25 https://api.github.com/repos/Brainicism/bgutil-ytdlp-pot-provider/releases/latest \
+                | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "provider 版本 = $TAG"
+          python3 -m pip install -q -U "bgutil-ytdlp-pot-provider==$TAG"
+
+      - name: 构建 POT provider 服务
+        run: |
+          git clone -q --single-branch --branch "$TAG" \
+            https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /tmp/bg
+          cd /tmp/bg/server
+          npm ci --silent
+          npx tsc
+
+      - name: 启动 provider 并探活
+        run: |
+          cd /tmp/bg/server
+          nohup node build/main.js --port 4416 > /tmp/bg.log 2>&1 &
+          sleep 8
+          echo "--- /ping ---"
+          curl -s -m 10 http://127.0.0.1:4416/ping || echo "(ping 无响应)"
+          echo ""
+          echo "--- provider 日志 ---"
+          tail -25 /tmp/bg.log
+
+      - name: 试取元信息（PO token 生效否）
+        env:
+          URL: ${{ inputs.url }}
+        run: |
+          yt-dlp --no-warnings --skip-download --print "  ✅ 成功 | %(title).60s | %(duration)s秒" "$URL" 2>&1 | tail -25
+
+      - name: 真下载 + 抽帧（端到端验证）
+        env:
+          URL: ${{ inputs.url }}
+        run: |
+          if yt-dlp --no-warnings -f "bv*[height<=360]+ba/b[height<=360]/b" \
+               --merge-output-format mp4 -o v.mp4 "$URL"; then
+            echo "  ✅ 下载成功"
+            ls -la v.mp4
+            echo "  时长: $(ffprobe -v error -show_entries format=duration -of csv=p=0 v.mp4) 秒"
+            mkdir -p frames
+            ffmpeg -hide_banner -loglevel error -i v.mp4 -vf "fps=1,scale=-2:360" -frames:v 8 frames/f%02d.jpg
+            echo "  抽帧: $(ls frames | wc -l) 张"
+            ls -la frames | head
+          else
+            echo "  ❌ 下载仍失败"
+          fi
