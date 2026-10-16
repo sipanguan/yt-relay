@@ -5,10 +5,16 @@ name: yt-watch
 # 无法直接访问。借 GitHub runner 的完整外网下载视频、抽帧、转写，结果 commit 回仓库，
 # 本机再经 codeload.github.com 拉回。
 #
-# ⚠️ 关键坑（已实测）：GitHub runner 的 Azure IP 段被 YouTube 整体标记，
+# ⚠️ 坑一（已实测）：GitHub runner 的 Azure IP 段被 YouTube 整体标记，
 #    任何 player_client（10 种）与 PO token（bgutil 2.0.2）都过不了
-#    "Sign in to confirm you're not a bot"。
-#    必须先套 Cloudflare WARP 换出口 IP（实测 20.163.4.37 → 104.28.205.117 后即可用）。
+#    "Sign in to confirm you're not a bot"。必须先套 Cloudflare WARP 换出口 IP。
+#
+# ⚠️ 坑二（已实测）：WARP 只该用于访问 YouTube。当年把 whisper 的 HuggingFace
+#    模型下载也放在 WARP 里，会报 "CAS Client Error: ... error decoding response body"。
+#    因此顺序是：WARP 起→下视频/音频→WARP 撤→再转写。
+#
+# ⚠️ 坑三：可选步骤必须 continue-on-error，但**光看步骤 [OK] 会被骗**——
+#    continue-on-error 会把失败标成成功。必须靠最后的「产物核验」判定。
 on:
   workflow_dispatch:
     inputs:
@@ -52,6 +58,11 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg wireguard-tools
           python3 -m pip install -q --upgrade yt-dlp
+          if [ "${{ inputs.transcribe }}" = "true" ]; then
+            # faster-whisper 必须和 av 一起升级，否则旧 av 报
+            # TypeError: open() got an unexpected keyword argument 'metadata_errors'
+            python3 -m pip install -q -U faster-whisper av
+          fi
           echo "yt-dlp = $(yt-dlp --version)"
 
       - name: 解析 URL
@@ -117,17 +128,22 @@ jobs:
             --sub-langs "zh.*,en.*" --sub-format vtt -o "out/subs" "$URL" || true
           ls -la out/ | grep -i sub || echo "无字幕轨"
 
-      - name: whisper 转写（可选，无字幕视频用）
+      - name: 下载音频（经 WARP，供转写用）
         if: ${{ inputs.transcribe == 'true' }}
-        continue-on-error: true   # 可选功能：失败不得拖死抽帧/提交这两个核心产物
         env:
           URL: ${{ steps.u.outputs.url }}
         run: |
-          # 两者必须一起升级，否则 av 版本过旧会报
-          # TypeError: open() got an unexpected keyword argument 'metadata_errors'
-          python3 -m pip install -q -U faster-whisper av
           yt-dlp --no-warnings -f "ba/b" -o "out/audio.%(ext)s" "$URL"
-          AUDIO=$(ls out/audio.* | head -1)
+          ls -la out/audio.*
+
+      - name: 撤掉 WARP（转写与提交都走正常网络）
+        if: always()
+        run: sudo wg-quick down /tmp/wgcf-profile.conf || true
+
+      - name: whisper 转写（可选；模型下载走正常网络，WARP 下会拉崩）
+        if: ${{ inputs.transcribe == 'true' }}
+        continue-on-error: true
+        run: |
           cat > /tmp/tr.py <<'PY'
           import sys
           from faster_whisper import WhisperModel
@@ -137,7 +153,33 @@ jobs:
           open("out/transcript.txt", "w").write("\n".join(lines))
           print("transcript segments:", len(lines))
           PY
-          python3 /tmp/tr.py "$AUDIO"
+          AUDIO=$(ls out/audio.* | head -1)
+          for i in 1 2 3; do
+            echo "--- 转写尝试 $i ---"
+            if python3 /tmp/tr.py "$AUDIO"; then echo "✅ 转写完成"; exit 0; fi
+            echo "失败，15 秒后重试"; sleep 15
+          done
+          echo "⚠️ 三次转写均失败，放行（不阻塞抽帧交付）"
+
+      - name: 产物核验（**唯一可信的成败判据**，不采信步骤自报）
+        if: always()
+        run: |
+          echo "════ 产物核验 ════"
+          NF=$(ls out/frames 2>/dev/null | wc -l)
+          echo "帧数         : $NF"
+          [ -f out/meta.json ] && echo "meta.json    : ✅ $(stat -c%s out/meta.json) 字节" || echo "meta.json    : ❌ 缺失"
+          if [ "${{ inputs.transcribe }}" = "true" ]; then
+            if [ -f out/transcript.txt ]; then
+              echo "transcript   : ✅ $(wc -l < out/transcript.txt) 行"
+            else
+              echo "transcript   : ❌ 缺失（转写没成功 —— 别被 whisper 步骤的 [OK] 骗了）"
+            fi
+          fi
+          if [ "$NF" -lt 1 ]; then
+            echo "::error::核心产物缺失：一张帧都没抽到"
+            exit 1
+          fi
+          echo "✅ 核心产物（帧）齐备"
 
       - name: 打包元信息
         if: always()
@@ -149,16 +191,13 @@ jobs:
             echo
             echo "- URL: $URL"
             echo "- 抽帧: $(ls out/frames 2>/dev/null | wc -l) 张"
+            echo "- 转写: $([ -f out/transcript.txt ] && echo "有 ($(wc -l < out/transcript.txt) 行)" || echo 无)"
             echo "- 时间: $(date -u +%FT%TZ)"
             echo
             echo "## 文件"
             find out -type f | sed 's/^/- /'
           } > out/SUMMARY.md
           cat out/SUMMARY.md
-
-      - name: 撤掉 WARP（提交走正常网络）
-        if: always()
-        run: sudo wg-quick down /tmp/wgcf-profile.conf || true
 
       - name: 提交回仓库（本机经 codeload 拉取）
         if: always()
@@ -168,6 +207,8 @@ jobs:
           rm -rf latest
           mkdir -p latest
           cp -r out/* latest/ 2>/dev/null || true
+          # 视频/音频是中间产物，不进仓库（否则每跑一次仓库涨几百 KB）
+          rm -f latest/video.* latest/audio.*
           rm -rf out
           git add -A
           git commit -m "yt-watch: $(date -u +%FT%TZ) [skip ci]" || echo "无变更"
