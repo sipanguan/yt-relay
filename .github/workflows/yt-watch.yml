@@ -1,9 +1,14 @@
 name: yt-watch
 
-# 用途：让 Agent“看” YouTube 视频。
+# 让 Agent “看” YouTube 视频。
 # 本机（阿里 DSW 容器）对 youtube.com / googlevideo.com 双重封锁（DNS 投毒 + IP 段阻断），
-# 无法直接访问；但 GitHub 的 runner 有完整外网。这里借用 runner 下载视频、抽帧、转写，
-# 结果 commit 回仓库，本机再经 codeload.github.com 拉回。
+# 无法直接访问。借 GitHub runner 的完整外网下载视频、抽帧、转写，结果 commit 回仓库，
+# 本机再经 codeload.github.com 拉回。
+#
+# ⚠️ 关键坑（已实测）：GitHub runner 的 Azure IP 段被 YouTube 整体标记，
+#    任何 player_client（10 种）与 PO token（bgutil 2.0.2）都过不了
+#    "Sign in to confirm you're not a bot"。
+#    必须先套 Cloudflare WARP 换出口 IP（实测 20.163.4.37 → 104.28.205.117 后即可用）。
 on:
   workflow_dispatch:
     inputs:
@@ -45,39 +50,48 @@ jobs:
       - name: 安装依赖
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
+          sudo apt-get install -y -qq ffmpeg wireguard-tools
           python3 -m pip install -q --upgrade yt-dlp
+          echo "yt-dlp = $(yt-dlp --version)"
 
       - name: 解析 URL
         id: u
         env:
           RAW: ${{ inputs.url }}
         run: |
-          RAW="$RAW"
-          if [ ${#RAW} -eq 11 ] && [[ "$RAW" =~ ^[A-Za-z0-9_-]+$ ]]; then
-            RAW="https://www.youtube.com/watch?v=$RAW"
+          U="$RAW"
+          if [ ${#U} -eq 11 ] && [[ "$U" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            U="https://www.youtube.com/watch?v=$U"
           fi
-          echo "url=$RAW" >> "$GITHUB_OUTPUT"
-          echo "解析为: $RAW"
+          echo "url=$U" >> "$GITHUB_OUTPUT"
+          echo "解析为: $U"
 
-      - name: 下载视频
+      - name: 套 Cloudflare WARP（换出口 IP，绕 YouTube 的 IP 信誉封锁）
+        run: |
+          set -e
+          TAG=$(curl -s -m 25 https://api.github.com/repos/ViRb3/wgcf/releases/latest \
+                | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
+          VER=${TAG#v}
+          echo "wgcf $TAG"
+          curl -fsSL -o /tmp/wgcf \
+            "https://github.com/ViRb3/wgcf/releases/download/${TAG}/wgcf_${VER}_linux_amd64"
+          chmod +x /tmp/wgcf
+          cd /tmp && /tmp/wgcf register --accept-tos && /tmp/wgcf generate
+          sudo wg-quick up /tmp/wgcf-profile.conf
+          sleep 5
+          echo "出口 IP: $(curl -s -m 20 https://api.ipify.org || echo 取不到)"
+
+      - name: 下载视频（经 WARP）
         env:
           URL: ${{ steps.u.outputs.url }}
           Q: ${{ inputs.quality }}
         run: |
-          set -x
           mkdir -p out/frames
-          # GitHub runner 的 IP 常被 YouTube 判为 bot，需用嵌入式播放器客户端降级绕过
-          # 顺序尝试: web_embedded -> web_safari -> ios，逐个客户端，任何一个成功即停
-          ARGS="--extractor-args youtube:player_client=web_embedded,web_safari,ios"
-          yt-dlp --no-warnings --player-external-args "" \
-            $ARGS \
+          yt-dlp --no-warnings \
             -f "bv*[height<=${Q}]+ba/b[height<=${Q}]/b" \
-            --merge-output-format mp4 -o "out/video.%(ext)s" "$URL" \
-          || yt-dlp --no-warnings --skip-download --print title --print id "$URL" >/dev/null 2>&1 || true
-          ls -la out/
-          # 元信息（降级客户端再取一次，失败不阻塞）
-          yt-dlp --no-warnings --skip-download --dump-single-json $ARGS "$URL" > out/meta.json || true
+            --merge-output-format mp4 -o "out/video.%(ext)s" "$URL"
+          yt-dlp --no-warnings --skip-download --dump-single-json "$URL" > out/meta.json || true
+          ls -la out/ out/frames/
 
       - name: 抽帧
         env:
@@ -87,22 +101,20 @@ jobs:
         run: |
           SRC=$(ls out/video.* | head -1)
           TOTAL=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$SRC" | cut -d. -f1)
-          # 有效时长
           if [ "$DUR" = "0" ]; then EFF=$((TOTAL - START)); else EFF=$DUR; fi
           [ "$EFF" -lt 1 ] && EFF=1
           FPS=$(python3 -c "print(max(0.02, $FRAMES/$EFF))")
           echo "总长=${TOTAL}s 起点=${START}s 取${EFF}s 抽 ${FRAMES} 帧 fps=$FPS"
           ffmpeg -hide_banner -loglevel error -ss "$START" -t "$EFF" -i "$SRC" \
             -vf "fps=$FPS,scale=-2:480" -q:v 3 out/frames/f%03d.jpg
-          ls -la out/frames/ | head -20
+          echo "实际抽帧: $(ls out/frames | wc -l) 张"
 
       - name: 抓字幕（有就抓，没有则跳过）
         env:
           URL: ${{ steps.u.outputs.url }}
         run: |
-          ARGS="--extractor-args youtube:player_client=web_embedded,web_safari,ios"
           yt-dlp --no-warnings --skip-download --write-subs --write-auto-subs \
-            --sub-langs "zh.*,en.*" --sub-format vtt -o "out/subs" $ARGS "$URL" || true
+            --sub-langs "zh.*,en.*" --sub-format vtt -o "out/subs" "$URL" || true
           ls -la out/ | grep -i sub || echo "无字幕轨"
 
       - name: whisper 转写（可选，无字幕视频用）
@@ -111,8 +123,7 @@ jobs:
           URL: ${{ steps.u.outputs.url }}
         run: |
           python3 -m pip install -q faster-whisper
-          ARGS="--extractor-args youtube:player_client=web_embedded,web_safari,ios"
-          yt-dlp --no-warnings -f "ba/b" -o "out/audio.%(ext)s" $ARGS "$URL"
+          yt-dlp --no-warnings -f "ba/b" -o "out/audio.%(ext)s" "$URL"
           AUDIO=$(ls out/audio.* | head -1)
           cat > /tmp/tr.py <<'PY'
           import sys
@@ -133,7 +144,7 @@ jobs:
             echo "# yt-watch 结果"
             echo
             echo "- URL: $URL"
-            echo "- 抽帧: ${{ inputs.frames }} 张"
+            echo "- 抽帧: $(ls out/frames 2>/dev/null | wc -l) 张"
             echo "- 时间: $(date -u +%FT%TZ)"
             echo
             echo "## 文件"
@@ -141,15 +152,18 @@ jobs:
           } > out/SUMMARY.md
           cat out/SUMMARY.md
 
+      - name: 撤掉 WARP（提交走正常网络）
+        if: always()
+        run: sudo wg-quick down /tmp/wgcf-profile.conf || true
+
       - name: 提交回仓库（本机经 codeload 拉取）
         run: |
           git config user.name  "yt-watch-bot"
           git config user.email "yt-watch-bot@users.noreply.github.com"
-          # 清掉上一轮结果，避免仓库膨胀
-          rm -rf latest out/video.* out/audio.*
+          rm -rf latest
           mkdir -p latest
           cp -r out/* latest/ 2>/dev/null || true
           rm -rf out
           git add -A
-          git commit -m "yt-watch: frames $(date -u +%FT%TZ) [skip ci]" || echo "无变更"
+          git commit -m "yt-watch: $(date -u +%FT%TZ) [skip ci]" || echo "无变更"
           git push
