@@ -1,0 +1,4 @@
+[    0.0] Alright, so here we are, one of the elephants.
+[    5.0] The cool thing about these guys is that they have really, really, really long trunks.
+[   13.0] And that's cool.
+[   17.0] And that's pretty much all there is to say.
