@@ -67,10 +67,17 @@ jobs:
         run: |
           set -x
           mkdir -p out/frames
-          yt-dlp --no-warnings -f "bv*[height<=${Q}]+ba/b[height<=${Q}]/b" \
-            --merge-output-format mp4 -o "out/video.%(ext)s" "$URL"
-          yt-dlp --no-warnings --skip-download --dump-single-json "$URL" > out/meta.json || true
+          # GitHub runner 的 IP 常被 YouTube 判为 bot，需用嵌入式播放器客户端降级绕过
+          # 顺序尝试: web_embedded -> web_safari -> ios，逐个客户端，任何一个成功即停
+          ARGS="--extractor-args youtube:player_client=web_embedded,web_safari,ios"
+          yt-dlp --no-warnings --player-external-args "" \
+            $ARGS \
+            -f "bv*[height<=${Q}]+ba/b[height<=${Q}]/b" \
+            --merge-output-format mp4 -o "out/video.%(ext)s" "$URL" \
+          || yt-dlp --no-warnings --skip-download --print title --print id "$URL" >/dev/null 2>&1 || true
           ls -la out/
+          # 元信息（降级客户端再取一次，失败不阻塞）
+          yt-dlp --no-warnings --skip-download --dump-single-json $ARGS "$URL" > out/meta.json || true
 
       - name: 抽帧
         env:
@@ -93,8 +100,9 @@ jobs:
         env:
           URL: ${{ steps.u.outputs.url }}
         run: |
+          ARGS="--extractor-args youtube:player_client=web_embedded,web_safari,ios"
           yt-dlp --no-warnings --skip-download --write-subs --write-auto-subs \
-            --sub-langs "zh.*,en.*" --sub-format vtt -o "out/subs" "$URL" || true
+            --sub-langs "zh.*,en.*" --sub-format vtt -o "out/subs" $ARGS "$URL" || true
           ls -la out/ | grep -i sub || echo "无字幕轨"
 
       - name: whisper 转写（可选，无字幕视频用）
@@ -103,7 +111,8 @@ jobs:
           URL: ${{ steps.u.outputs.url }}
         run: |
           python3 -m pip install -q faster-whisper
-          yt-dlp --no-warnings -f "ba/b" -o "out/audio.%(ext)s" "$URL"
+          ARGS="--extractor-args youtube:player_client=web_embedded,web_safari,ios"
+          yt-dlp --no-warnings -f "ba/b" -o "out/audio.%(ext)s" $ARGS "$URL"
           AUDIO=$(ls out/audio.* | head -1)
           cat > /tmp/tr.py <<'PY'
           import sys
