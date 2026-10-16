@@ -3,11 +3,10 @@
 - URL: https://www.youtube.com/watch?v=jNQXAC9IVRw
 - 抽帧: 12 张
 - 转写: 无
-- 时间: 2026-10-16T16:29:01Z
+- 时间: 2026-10-16T16:43:05Z
 
 ## 文件
 - out/SUMMARY.md
-- out/audio.webm
 - out/video.mp4
 - out/frames/f006.jpg
 - out/frames/f002.jpg
