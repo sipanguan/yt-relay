@@ -119,10 +119,13 @@ jobs:
 
       - name: whisper 转写（可选，无字幕视频用）
         if: ${{ inputs.transcribe == 'true' }}
+        continue-on-error: true   # 可选功能：失败不得拖死抽帧/提交这两个核心产物
         env:
           URL: ${{ steps.u.outputs.url }}
         run: |
-          python3 -m pip install -q faster-whisper
+          # 两者必须一起升级，否则 av 版本过旧会报
+          # TypeError: open() got an unexpected keyword argument 'metadata_errors'
+          python3 -m pip install -q -U faster-whisper av
           yt-dlp --no-warnings -f "ba/b" -o "out/audio.%(ext)s" "$URL"
           AUDIO=$(ls out/audio.* | head -1)
           cat > /tmp/tr.py <<'PY'
@@ -137,6 +140,7 @@ jobs:
           python3 /tmp/tr.py "$AUDIO"
 
       - name: 打包元信息
+        if: always()
         env:
           URL: ${{ steps.u.outputs.url }}
         run: |
@@ -157,6 +161,7 @@ jobs:
         run: sudo wg-quick down /tmp/wgcf-profile.conf || true
 
       - name: 提交回仓库（本机经 codeload 拉取）
+        if: always()
         run: |
           git config user.name  "yt-watch-bot"
           git config user.email "yt-watch-bot@users.noreply.github.com"
