@@ -1,0 +1,164 @@
+name: warp-fetch
+
+# 通用「经 WARP 取回被墙资源」中继。
+# 本机（阿里 DSW 容器）对 google.com / youtube.com / huggingface.co 等双重封锁
+# （DNS 投毒 + IP 段阻断），且容器无 NET_ADMIN、无 /dev/net/tun，自己建不了隧道。
+# 所以借 GitHub runner 的完整外网 + Cloudflare WARP 换出口 IP 去取，结果 commit 回仓库，
+# 本机再经 codeload.github.com / api.github.com 拉回。
+#
+# ⚠️ 坑一（已实测）：不加 WARP 的话，runner 的 Azure IP 段被很多站点整体拉黑。
+# ⚠️ 坑二（已实测）：WARP 同时给 v4/v6，走 IPv6 常握手超时（_ssl.c:983）
+#    → 必须 --force-ipv4 + 加大重试。
+# ⚠️ 坑三：不看步骤 [OK]，只看最后的「产物核验」——continue-on-error 会把失败标成成功。
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: '要取回的完整 URL'
+        required: true
+        type: string
+      out:
+        description: '保存文件名（留空则自动从 URL 推断）'
+        required: false
+        default: ''
+        type: string
+      mode:
+        description: 'file=按二进制下 / page=存网页HTML并附文本预览'
+        required: false
+        type: choice
+        options: ['file', 'page']
+        default: 'file'
+      referer:
+        description: '可选 Referer（部分站点防盗链）'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析参数
+        id: p
+        env:
+          RAWURL: ${{ inputs.url }}
+          RAWOUT: ${{ inputs.out }}
+        run: |
+          U="$RAWURL"
+          O="$RAWOUT"
+          if [ -z "$O" ]; then
+            O=$(python3 -c 'import sys,urllib.parse as up; p=up.urlparse(sys.argv[1]).path; n=p.rstrip("/").split("/")[-1] or "index"; print(up.unquote(n))' "$U")
+          fi
+          O=$(printf '%s' "$O" | tr -c 'A-Za-z0-9._-' '_')
+          [ -n "$O" ] || O=download.bin
+          echo "url=$U" >> "$GITHUB_OUTPUT"
+          echo "out=$O" >> "$GITHUB_OUTPUT"
+          echo "解析: URL=$U  OUT=$O"
+
+      - name: 套 Cloudflare WARP（换出口 IP）
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools curl ca-certificates
+          TAG=$(curl -s -m 25 https://api.github.com/repos/ViRb3/wgcf/releases/latest \
+                | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
+          VER=${TAG#v}
+          echo "wgcf $TAG"
+          curl -fsSL -o /tmp/wgcf \
+            "https://github.com/ViRb3/wgcf/releases/download/${TAG}/wgcf_${VER}_linux_amd64"
+          chmod +x /tmp/wgcf
+          cd /tmp && /tmp/wgcf register --accept-tos && /tmp/wgcf generate
+          sudo wg-quick up /tmp/wgcf-profile.conf
+          sleep 5
+          echo "出口 IP: $(curl -s -m 20 --force-ipv4 https://api.ipify.org || echo 取不到)"
+
+      - name: 目标可达性探测（先证明通道真打开了）
+        env:
+          URL: ${{ steps.p.outputs.url }}
+        run: |
+          echo "════ 目标探测 ════"
+          curl -s -o /dev/null -m 30 --force-ipv4 -w "目标 HTTP=%{http_code} 耗时=%{time_total}s IP=%{remote_ip}\n" "$URL" || echo "  目标 curl 失败"
+          curl -s -o /dev/null -m 20 --force-ipv4 -w "探针 google.com HTTP=%{http_code}\n" https://www.google.com || echo "  探针 google 不通"
+
+      - name: 取回（经 WARP）
+        env:
+          URL: ${{ steps.p.outputs.url }}
+          OUT: ${{ steps.p.outputs.out }}
+          REF: ${{ inputs.referer }}
+        run: |
+          mkdir -p out
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0 Safari/537.36"
+          ok=0
+          for i in 1 2 3 4 5; do
+            echo "--- 尝试 $i ---"
+            if [ -n "$REF" ]; then
+              curl -fL --force-ipv4 --retries 10 --retry-delay 5 --connect-timeout 30 --max-time 900 \
+                -A "$UA" -e "$REF" -o "out/$OUT" "$URL" && ok=1 && break
+            else
+              curl -fL --force-ipv4 --retries 10 --retry-delay 5 --connect-timeout 30 --max-time 900 \
+                -A "$UA" -o "out/$OUT" "$URL" && ok=1 && break
+            fi
+            echo "失败，15s 后重试"
+            sleep 15
+          done
+          if [ "$ok" != "1" ]; then echo "::error::五次取回均失败"; exit 1; fi
+          ls -la out/
+
+      - name: 网页模式附加文本预览
+        if: ${{ inputs.mode == 'page' }}
+        env:
+          OUT: ${{ steps.p.outputs.out }}
+        run: |
+          python3 scripts/html2text_preview.py "out/$OUT" "out/PREVIEW.txt"
+          head -c 500 out/PREVIEW.txt
+
+      - name: 产物核验（**唯一可信判据**，不采信步骤自报）
+        if: always()
+        env:
+          OUT: ${{ steps.p.outputs.out }}
+        run: |
+          echo "════ 产物核验 ════"
+          F="out/$OUT"
+          if [ ! -f "$F" ]; then echo "::error::产物不存在: $F"; exit 1; fi
+          SZ=$(stat -c%s "$F")
+          echo "文件      : $OUT"
+          echo "大小      : $SZ 字节"
+          echo "前16字节  : $(head -c 16 "$F" | xxd -p)"
+          if [ "$SZ" -lt 64 ]; then echo "::error::文件过小，疑似错误页"; exit 1; fi
+          echo "✅ 产物存在且非空"
+
+      - name: 打包摘要
+        if: always()
+        env:
+          URL: ${{ steps.p.outputs.url }}
+          OUT: ${{ steps.p.outputs.out }}
+        run: |
+          SZ=$(stat -c%s "out/$OUT" 2>/dev/null || echo 0)
+          {
+            echo "# warp-fetch 结果"
+            echo
+            echo "- URL: $URL"
+            echo "- 文件: $OUT ($SZ 字节)"
+            echo "- 模式: ${{ inputs.mode }}"
+            echo "- 提交时间: $(date -u +%FT%TZ)"
+          } > out/SUMMARY.md
+          cat out/SUMMARY.md
+
+      - name: 提交回仓库
+        if: always()
+        run: |
+          git config user.name  "warp-fetch-bot"
+          git config user.email "warp-fetch-bot@users.noreply.github.com"
+          rm -rf fetch
+          mkdir -p fetch
+          cp -r out/* fetch/ 2>/dev/null || true
+          rm -rf out
+          BIG=$(find fetch -type f -size +90M | head -1)
+          if [ -n "$BIG" ]; then echo "::error::产物超过 90MB，无法入仓: $BIG"; exit 1; fi
+          git add -A
+          git commit -m "warp-fetch: $(date -u +%FT%TZ) [skip ci]" || echo "无变更"
+          git push
