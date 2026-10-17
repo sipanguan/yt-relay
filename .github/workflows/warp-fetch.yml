@@ -83,7 +83,7 @@ jobs:
           URL: ${{ steps.p.outputs.url }}
         run: |
           echo "════ 目标探测 ════"
-          curl -s -o /dev/null -m 30 -4 -w "目标 HTTP=%{http_code} 耗时=%{time_total}s IP=%{remote_ip}\n" "$URL" || echo "  目标 curl 失败"
+          curl -s -o /dev/null -m 60 -4 -w "目标 HTTP=%{http_code} 耗时=%{time_total}s IP=%{remote_ip}\n" "$URL" || echo "  目标 curl 失败"
           curl -s -o /dev/null -m 20 -4 -w "探针 google.com HTTP=%{http_code}\n" https://www.google.com || echo "  探针 google 不通"
 
       - name: 取回（经 WARP）
@@ -93,18 +93,20 @@ jobs:
           REF: ${{ inputs.referer }}
         run: |
           mkdir -p out
+          echo "curl 版本: $(curl --version | head -1)"
+          echo "curl 路径: $(command -v curl)"
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0 Safari/537.36"
           ok=0
           for i in 1 2 3 4 5; do
             echo "--- 尝试 $i ---"
             if [ -n "$REF" ]; then
-              curl -fL -4 --retries 10 --retry-delay 5 --connect-timeout 30 --max-time 900 \
+              curl -fL -4 --connect-timeout 30 --max-time 900 \
                 -A "$UA" -e "$REF" -o "out/$OUT" "$URL" && ok=1 && break
             else
-              curl -fL -4 --retries 10 --retry-delay 5 --connect-timeout 30 --max-time 900 \
+              curl -fL -4 --connect-timeout 30 --max-time 900 \
                 -A "$UA" -o "out/$OUT" "$URL" && ok=1 && break
             fi
-            echo "失败，15s 后重试"
+            echo "失败（退出码 $?），15s 后重试"
             sleep 15
           done
           if [ "$ok" != "1" ]; then echo "::error::五次取回均失败"; exit 1; fi
