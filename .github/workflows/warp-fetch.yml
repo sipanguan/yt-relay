@@ -8,7 +8,8 @@ name: warp-fetch
 #
 # ⚠️ 坑一（已实测）：不加 WARP 的话，runner 的 Azure IP 段被很多站点整体拉黑。
 # ⚠️ 坑二（已实测）：WARP 同时给 v4/v6，走 IPv6 常握手超时（_ssl.c:983）
-#    → 必须 --force-ipv4 + 加大重试。
+#    → curl 必须 -4（⚠️ 不是 yt-dlp 的 --force-ipv4，那是 yt-dlp 专有参数，
+#      curl 会直接报 unknown option 秒失败）+ 加大重试。
 # ⚠️ 坑三：不看步骤 [OK]，只看最后的「产物核验」——continue-on-error 会把失败标成成功。
 on:
   workflow_dispatch:
@@ -74,15 +75,16 @@ jobs:
           cd /tmp && /tmp/wgcf register --accept-tos && /tmp/wgcf generate
           sudo wg-quick up /tmp/wgcf-profile.conf
           sleep 5
-          echo "出口 IP: $(curl -s -m 20 --force-ipv4 https://api.ipify.org || echo 取不到)"
+          echo "出口 IP: $(curl -s -m 20 -4 https://api.ipify.org || echo 取不到)"
+          echo "（注：curl 用 -4，不要写 yt-dlp 的 --force-ipv4 —— 那是 yt-dlp 专有参数，curl 会直接报 unknown option 秒失败）"
 
       - name: 目标可达性探测（先证明通道真打开了）
         env:
           URL: ${{ steps.p.outputs.url }}
         run: |
           echo "════ 目标探测 ════"
-          curl -s -o /dev/null -m 30 --force-ipv4 -w "目标 HTTP=%{http_code} 耗时=%{time_total}s IP=%{remote_ip}\n" "$URL" || echo "  目标 curl 失败"
-          curl -s -o /dev/null -m 20 --force-ipv4 -w "探针 google.com HTTP=%{http_code}\n" https://www.google.com || echo "  探针 google 不通"
+          curl -s -o /dev/null -m 30 -4 -w "目标 HTTP=%{http_code} 耗时=%{time_total}s IP=%{remote_ip}\n" "$URL" || echo "  目标 curl 失败"
+          curl -s -o /dev/null -m 20 -4 -w "探针 google.com HTTP=%{http_code}\n" https://www.google.com || echo "  探针 google 不通"
 
       - name: 取回（经 WARP）
         env:
@@ -96,10 +98,10 @@ jobs:
           for i in 1 2 3 4 5; do
             echo "--- 尝试 $i ---"
             if [ -n "$REF" ]; then
-              curl -fL --force-ipv4 --retries 10 --retry-delay 5 --connect-timeout 30 --max-time 900 \
+              curl -fL -4 --retries 10 --retry-delay 5 --connect-timeout 30 --max-time 900 \
                 -A "$UA" -e "$REF" -o "out/$OUT" "$URL" && ok=1 && break
             else
-              curl -fL --force-ipv4 --retries 10 --retry-delay 5 --connect-timeout 30 --max-time 900 \
+              curl -fL -4 --retries 10 --retry-delay 5 --connect-timeout 30 --max-time 900 \
                 -A "$UA" -o "out/$OUT" "$URL" && ok=1 && break
             fi
             echo "失败，15s 后重试"
